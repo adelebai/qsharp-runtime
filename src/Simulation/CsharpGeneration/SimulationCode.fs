@@ -42,6 +42,7 @@ module SimulationCode =
             "System"
             "Microsoft.Quantum.Core"
             "Microsoft.Quantum.Intrinsic"
+            "Microsoft.Quantum.Intrinsic.Interfaces"
             "Microsoft.Quantum.Simulation.Core"
         ]
 
@@ -913,6 +914,14 @@ module SimulationCode =
             ``{`` [] ``}``
         :> MemberDeclarationSyntax
 
+    /// Returns the constructor for the given intrinsic operation.
+    let buildIntrinsicConstructor context name : MemberDeclarationSyntax =
+        ``constructor`` name ``(`` [ ("m", ``type`` ("IGate_" + name)) ] ``)``
+            ``:`` [ "m" ]
+            [ ``public`` ]
+            ``{`` [] ``}``
+        :> MemberDeclarationSyntax
+
     /// For each Operation used in the given OperationDeclartion, returns
     /// a Property that returns an instance of the operation by calling the
     /// IOperationFactory
@@ -957,15 +966,9 @@ module SimulationCode =
             (``=>`` newInstance)
         :> MemberDeclarationSyntax
 
-    let buildSpecializationBody context (sp:QsSpecialization) =
-        match sp.Implementation with
-        | Provided (args, _) ->
+    let buildSpecializationBody context (op:QsCallable) (sp:QsSpecialization) =
+        let buildOne args statements = 
             let returnType  = sp.Signature.ReturnType
-            let statements  =
-                let builder = new SyntaxBuilder(context)
-                builder.Namespaces.OnSpecializationDeclaration sp |> ignore
-                builder.BuiltStatements
-
             let inData = ``ident`` "__in__"
             let ret =
                 match returnType.Resolution with
@@ -977,7 +980,6 @@ module SimulationCode =
                 | _ ->
                     []
             let (argName, argsInit) =
-//TODO: diagnostics.
                 let name = function | ValidName n -> n | InvalidName -> ""
                 let rec buildVariableName = function
                     | QsTupleItem  one -> one.VariableName |> name
@@ -993,6 +995,13 @@ module SimulationCode =
                         ("__in__", [ ``var`` (buildVariableName args) (``:=`` <| inData) ])
 
             Some (``() => {}`` [ argName ] (argsInit @ statements @ ret) :> ExpressionSyntax)
+        match sp.Implementation with
+        | Provided (args, _) ->
+            let statements  =
+                let builder = new SyntaxBuilder(context)
+                builder.Namespaces.OnSpecializationDeclaration sp |> ignore
+                builder.BuiltStatements
+            buildOne args statements
         | Generated SelfInverse ->
             let adjointedBodyName =
                 match sp.Kind with
@@ -1001,10 +1010,44 @@ module SimulationCode =
 //TODO: diagnostics.
                 | _ -> "__Body__"
             Some (``ident`` adjointedBodyName :> ExpressionSyntax)
+        | Intrinsic ->
+            let name = function | ValidName n -> ``ident`` n | InvalidName -> ``ident`` ""
+            let rec argsToVars = function
+                | QsTupleItem one -> [one.VariableName |> name]
+                | QsTuple many -> many |> Seq.map argsToVars |> List.concat
+
+            let args =
+                match sp.Kind with
+                | QsControlled | QsControlledAdjoint ->
+                    let ctlVar =
+                        let name = ValidName("__controlQubits__")
+                        let varType = Qubit |> ResolvedType.New |> ArrayType |> ResolvedType.New
+                        let info = InferredExpressionInformation.New(false, false)
+                        let pos = QsNullable<Position>.Null
+                        let range = Range.Zero
+                        {VariableName = name; Type = varType; InferredInformation = info; Position = pos; Range = range}
+                    match op.ArgumentTuple with
+                    | QsTuple many when many.Length = 1 ->
+                        QsTuple(ImmutableArray.Create(QsTupleItem(ctlVar), many.[0]))
+                    | _ -> QsTuple(ImmutableArray.Create(QsTupleItem(ctlVar), op.ArgumentTuple))
+                | _ -> op.ArgumentTuple
+
+            let specCall =
+                (userDefinedName None op.FullName.Name) + "_" +
+                match sp.Kind with
+                | QsBody -> ""
+                | QsAdjoint -> "Adjoint"
+                | QsControlled -> "Controlled"
+                | QsControlledAdjoint -> "ControlledAdjoint"
+                + "Body"
+
+            let statements =
+                [ (``ident`` "Gate") <.> (``ident`` specCall, argsToVars args) |> statement ]
+            buildOne args statements
         | _ ->
             None
 
-    let buildSpecialization context (sp:QsSpecialization) : (PropertyDeclarationSyntax * _) option =
+    let buildSpecialization context (op:QsCallable) (sp:QsSpecialization) : (PropertyDeclarationSyntax * _) option =
         let inType  = roslynTypeName context sp.Signature.ArgumentType
         let outType = roslynTypeName context sp.Signature.ReturnType
         let propertyType = "Func<" + inType + ", " + outType + ">"
@@ -1014,7 +1057,7 @@ module SimulationCode =
             | QsAdjoint           -> "Adjoint"
             | QsControlled        -> "Controlled"
             | QsControlledAdjoint -> "ControlledAdjoint"
-        let body = buildSpecializationBody context sp
+        let body = buildSpecializationBody context op sp
         let attributes =
             match sp.Location with
             | Null -> []
@@ -1217,6 +1260,10 @@ module SimulationCode =
             ``get`` (``=>`` (``literal`` name) )
         :> MemberDeclarationSyntax
 
+    let buildGate name =
+        ``propg`` ("IGate_" + name) "Gate" [ ``private``; ``protected`` ]
+        :> MemberDeclarationSyntax
+
     let buildFullName (name : QsQualifiedName) =
         let fqn =
             let ns = name.Namespace
@@ -1336,7 +1383,7 @@ module SimulationCode =
         let nonGeneric = if typeParameters.IsEmpty then name else sprintf "%s<%s>" name (String.Join(",", typeParameters))
         (name, nonGeneric)
 
-    let isAbstract op =
+    let isIntrinsic op =
         let isBody (sp:QsSpecialization) = match sp.Kind with | QsBody when sp.Implementation <> Intrinsic -> true | _ -> false
         not (op.Specializations |> Seq.exists isBody)
 
@@ -1385,16 +1432,19 @@ module SimulationCode =
         let opNames = operationDependencies op
         let inType   = op.Signature.ArgumentType |> roslynTypeName context
         let outType  = op.Signature.ReturnType   |> roslynTypeName context
+        let opIsIntrinsic = isIntrinsic op
 
-        let constructors = [ (buildConstructor context name) ]
+        let constructors = [ ((if opIsIntrinsic then buildIntrinsicConstructor else buildConstructor) context name) ]
         let properties =
             let opProperties = buildOpsProperties context opNames
-            buildName name ::
-            buildFullName context.current.Value ::
-            if globalContext.entryPoints |> Seq.contains op.FullName then
-                buildOperationInfoProperty globalContext inType outType nonGenericName ::
-                opProperties
-            else opProperties
+            [
+                yield buildName name
+                yield buildFullName context.current.Value
+                if globalContext.entryPoints |> Seq.contains op.FullName then
+                    yield buildOperationInfoProperty globalContext inType outType nonGenericName
+                if opIsIntrinsic then yield buildGate name
+                yield! opProperties
+            ]
 
         let baseOp =
             if isFunction op then
@@ -1411,7 +1461,7 @@ module SimulationCode =
         let typeParameters = typeParametersNames op.Signature
         let baseClass = genericBase baseOp ``<<`` typeArgsInterface ``>>``
         let bodies, attr =
-            op.Specializations |> Seq.map (buildSpecialization context) |> Seq.choose id |> Seq.toList
+            op.Specializations |> Seq.map (buildSpecialization context op) |> Seq.choose id |> Seq.toList
             |> List.map (fun (x, y) -> (x :> MemberDeclarationSyntax, y)) |> List.unzip
         let inData  = (buildDataWrapper context "In"  op.Signature.ArgumentType)
         let outData = (buildDataWrapper context "Out" op.Signature.ReturnType)
@@ -1441,7 +1491,7 @@ module SimulationCode =
 
         let modifiers =
             let access = classAccessModifier op.Modifiers.Access
-            if isAbstract op then
+            if opIsIntrinsic then
                 [ access; ``abstract``; ``partial`` ]
             else
                 [ access; ``partial`` ]
