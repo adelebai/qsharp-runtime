@@ -63,15 +63,15 @@ target_link_libraries(qir-tracer-tests PUBLIC
   ${QIR_TESTS_LIBS}
   ${QIR_BRIDGE_UTILITY_LIB}
   tracer
+  qir-rt-support
 )
 
 target_include_directories(qir-tracer-tests PUBLIC
   "${test_includes}"
   "${public_includes}"
-  "${PROJECT_SOURCE_DIR}/lib/QIR"
+  "${PROJECT_SOURCE_DIR}/lib/Tracer"
 )
 add_dependencies(qir-tracer-tests qir_tracer_test_lib)
 
 install(TARGETS qir-tracer-tests RUNTIME DESTINATION "${CMAKE_BINARY_DIR}/bin")
 add_unit_test(qir-tracer-tests)
-
